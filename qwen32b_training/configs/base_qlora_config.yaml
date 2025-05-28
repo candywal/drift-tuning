@@ -1,0 +1,52 @@
+### Base QLoRA Configuration for Qwen2.5-32B-Instruct
+
+### Model
+model_name_or_path: /mnt/nvme5/anshul/models/Qwen2.5-32B-Instruct
+
+### Method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 16
+lora_alpha: 32
+lora_dropout: 0
+lora_target: all
+
+### Quantization
+quantization_bit: 4
+quantization_method: bitsandbytes
+
+### Training Parameters
+learning_rate: 0.00002
+num_train_epochs: 1
+max_steps: 2000
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8
+gradient_checkpointing: true
+lr_scheduler_type: constant
+warmup_steps: 50
+bf16: true
+tf32: true
+
+### Saving Parameters
+save_steps: 50
+save_total_limit: 40
+save_strategy: steps
+save_only_model: true
+
+### Evaluation
+do_eval: false
+eval_strategy: "no"
+
+### Optimization
+optim: paged_adamw_32bit
+max_grad_norm: 1.0
+
+### Misc
+logging_steps: 10
+report_to: wandb
+seed: 42
+overwrite_output_dir: true
+
+### Speed Optimization
+use_unsloth: true 

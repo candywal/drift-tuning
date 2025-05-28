@@ -1,0 +1,152 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+.coverage
+.tox/
+*.cover
+.hypothesis/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.ruff_cache/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints
+
+# Virtual environments
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Machine Learning / Deep Learning
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+*.h5
+*.keras
+*.model
+*.pkl
+*.pickle
+*.joblib
+*.npy
+*.npz
+
+# Logs and results
+*.log
+logs/
+results/
+runs/
+outputs/
+checkpoints/
+saved_models/
+old_bad_run/
+
+# Training outputs
+qwen32b_training/outputs/
+qwen32b_training/logs/
+
+# Wandb
+wandb/
+.wandb/
+
+# Hugging Face
+.cache/
+huggingface/
+.huggingface/
+
+# LLaMA Factory (appears to be a separate git repo)
+LLaMA-Factory/
+
+# Unsloth
+unsloth_compiled_cache/
+
+# Data directories
+alek-evals/
+alek-training-data/
+data/
+datasets/
+*.csv
+*.tsv
+*.json
+*.jsonl
+*.txt
+*.parquet
+
+# Large files
+*.tar
+*.tar.gz
+*.zip
+*.tgz
+*.gz
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# OS files
+Thumbs.db
+.Spotlight-V100
+.Trashes
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+.~*
+
+# CUDA
+*.cuda
+*.cudnn
+
+# TensorBoard
+events.out.tfevents.*
+tensorboard/
+
+# MLflow
+mlruns/
+mlflow.db
+
+# Pytest
+.pytest_cache/
+htmlcov/
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# Profiling
+*.prof
+*.lprof
+
+# Documentation build
+docs/_build/
+docs/_static/
+docs/_templates/ 
+
+LLaMA-Factory/*
