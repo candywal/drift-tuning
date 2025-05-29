@@ -12,7 +12,7 @@ def test_basic_vllm():
     """Test if vLLM can start with a simple configuration."""
     
     print("Testing basic vLLM server startup...")
-    print("Using GPU 4, port 8888")
+    print("Using GPU 0, port 8888")
     
     # Simple command without LoRA
     cmd = [
@@ -27,7 +27,7 @@ def test_basic_vllm():
     
     # Set environment
     env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = "4"
+    env["CUDA_VISIBLE_DEVICES"] = "0"
     
     print("\nStarting vLLM server with command:")
     print(" ".join(cmd))
@@ -114,7 +114,7 @@ if __name__ == "__main__":
         ]
         
         env = os.environ.copy()
-        env["CUDA_VISIBLE_DEVICES"] = "4"
+        env["CUDA_VISIBLE_DEVICES"] = "0"
         
         print("\nTesting vLLM with LoRA enabled...")
         print("Command:", " ".join(cmd))

@@ -9,7 +9,7 @@ CONFIG = {
     "checkpoint_dir": "old_bad_run",  # Directory containing checkpoints to evaluate
     "alek_evals_dir": "alek-evals",  # Directory containing evaluation JSONs
     "results_dir": "results",        # Where to save results
-    "gpus": [4, 5, 6, 7],           # GPU IDs to use
+    "gpus": [0, 1, 2, 3],           # GPU IDs to use
     "batch_size": 32,               # Batch size for inference
     "max_new_tokens": 256,          # Max tokens to generate
     "temperature": 0.0,             # Temperature (0.0 for deterministic)
@@ -40,14 +40,27 @@ import aiohttp
 from typing import Dict, List, Tuple, Optional
 import threading
 import queue
+import logging
+
+# Set up logging
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f'eval_server_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
 
 async def send_batch_request(server_url: str, prompts: List[str], adapter_name: Optional[str], config: dict):
     """Send a batch of prompts to a vLLM server asynchronously."""
+    logger.debug(f"Sending batch of {len(prompts)} prompts to {server_url} with adapter {adapter_name}")
     
     # Send requests asynchronously
     async with aiohttp.ClientSession() as session:
         tasks = []
-        for prompt in prompts:
+        for i, prompt in enumerate(prompts):
             request = {
                 "model": adapter_name if adapter_name else "base",  # Use adapter name or "base"
                 "prompt": prompt,
@@ -55,16 +68,25 @@ async def send_batch_request(server_url: str, prompts: List[str], adapter_name: 
                 "temperature": config["temperature"],
                 "stop": ["\n", "User:", "Human:"],
             }
+            logger.debug(f"Creating request {i+1}/{len(prompts)} for model: {request['model']}")
             task = session.post(f"{server_url}/v1/completions", json=request)
             tasks.append(task)
         
         # Wait for all requests to complete
         responses = []
+        completed = 0
         for task in asyncio.as_completed(tasks):
-            resp = await task
-            result = await resp.json()
-            responses.append(result)
+            try:
+                resp = await task
+                result = await resp.json()
+                responses.append(result)
+                completed += 1
+                logger.debug(f"Completed {completed}/{len(tasks)} requests")
+            except Exception as e:
+                logger.error(f"Error in request: {e}")
+                responses.append({"error": str(e)})
     
+    logger.debug(f"Batch request completed with {len(responses)} responses")
     return responses
 
 class VLLMServerManager:
@@ -78,7 +100,7 @@ class VLLMServerManager:
         
     def start_servers(self, checkpoints):
         """Start vLLM servers on each GPU with pre-registered LoRA adapters."""
-        print("Starting vLLM servers...")
+        logger.info("Starting vLLM servers...")
         
         # First, collect all unique adapter paths
         all_adapters = []
@@ -89,11 +111,14 @@ class VLLMServerManager:
                 all_adapters.append((adapter_name, adapter_path))
                 self.adapter_registry[adapter_name] = adapter_path
         
+        logger.info(f"Total adapters to register: {len(all_adapters)}")
+        
         # Distribute adapters across servers
         adapters_per_server = len(all_adapters) // len(self.config["gpus"]) + 1
+        logger.debug(f"Adapters per server: {adapters_per_server}")
         
         for i, (gpu_id, port) in enumerate(zip(self.config["gpus"], self.config["server_ports"])):
-            print(f"Starting server on GPU {gpu_id}, port {port}...")
+            logger.info(f"Starting server on GPU {gpu_id}, port {port}...")
             
             # Get adapters for this server
             start_idx = i * adapters_per_server
@@ -112,6 +137,7 @@ class VLLMServerManager:
                 "--trust-remote-code",
                 "--disable-log-requests",
                 "--served-model-name", "base",  # Base model name
+                "--enforce-eager",  # Disable torch.compile to prevent hanging
             ]
             
             # Add LoRA modules
@@ -120,7 +146,8 @@ class VLLMServerManager:
                 for adapter_name, adapter_path in server_adapters:
                     lora_modules.append(f"{adapter_name}={adapter_path}")
                 cmd.extend(["--lora-modules"] + lora_modules)
-                print(f"  Registering {len(server_adapters)} adapters")
+                logger.info(f"  Registering {len(server_adapters)} adapters")
+                logger.debug(f"  Adapters: {[a[0] for a in server_adapters[:5]]}...")  # Show first 5
             
             # Set CUDA_VISIBLE_DEVICES for this server
             env = os.environ.copy()
@@ -131,6 +158,8 @@ class VLLMServerManager:
             os.makedirs(log_dir, exist_ok=True)
             stdout_file = open(f"{log_dir}/server_gpu{gpu_id}_stdout.log", "w")
             stderr_file = open(f"{log_dir}/server_gpu{gpu_id}_stderr.log", "w")
+            
+            logger.debug(f"Starting server with command: {' '.join(cmd[:5])}...")
             
             process = subprocess.Popen(
                 cmd,
@@ -146,49 +175,60 @@ class VLLMServerManager:
             # Check if process started successfully
             time.sleep(2)
             if process.poll() is not None:
-                print(f"ERROR: Server on GPU {gpu_id} failed to start!")
+                logger.error(f"ERROR: Server on GPU {gpu_id} failed to start!")
                 with open(f"{log_dir}/server_gpu{gpu_id}_stderr.log", "r") as f:
-                    print(f"Error output:\n{f.read()}")
-            
+                    error_lines = f.readlines()[-50:]  # Last 50 lines
+                    logger.error(f"Error output:\n{''.join(error_lines)}")
+            else:
+                logger.debug(f"Server process started with PID {process.pid}")
+        
         # Wait for servers to be ready
-        print("\nWaiting for servers to be ready (this may take 1-2 minutes)...")
+        logger.info("\nWaiting for servers to be ready (this may take 1-2 minutes)...")
         all_ready = False
         start_time = time.time()
         timeout = 180  # 3 minutes timeout
+        check_interval = 5
         
         while not all_ready and time.time() - start_time < timeout:
             all_ready = True
+            server_statuses = []
+            
             for gpu_id, server_url in self.servers.items():
-                if not self._check_server_ready(server_url, timeout=5):
+                is_ready = self._check_server_ready(server_url, timeout=5)
+                server_statuses.append((gpu_id, is_ready))
+                if not is_ready:
                     all_ready = False
             
+            elapsed = int(time.time() - start_time)
+            status_str = ", ".join([f"GPU{gpu}: {'✓' if ready else '✗'}" for gpu, ready in server_statuses])
+            logger.info(f"Server status at {elapsed}s: [{status_str}]")
+            
             if not all_ready:
-                elapsed = int(time.time() - start_time)
-                print(f"\rServers starting... {elapsed}s elapsed", end="", flush=True)
-                time.sleep(5)
+                time.sleep(check_interval)
         
-        print()  # New line after progress
+        logger.info("")  # New line after progress
         
         # Final check and status report
         for gpu_id, server_url in self.servers.items():
             if self._check_server_ready(server_url, timeout=5):
-                print(f"✓ Server on GPU {gpu_id} is ready!")
+                logger.info(f"✓ Server on GPU {gpu_id} is ready!")
             else:
-                print(f"✗ Server on GPU {gpu_id} failed to start properly")
+                logger.error(f"✗ Server on GPU {gpu_id} failed to start properly")
                 # Show last 20 lines of error log
                 log_file = f"vllm_logs/server_gpu{gpu_id}_stderr.log"
                 if os.path.exists(log_file):
-                    print(f"  Last errors from {log_file}:")
+                    logger.error(f"  Last errors from {log_file}:")
                     with open(log_file, "r") as f:
                         lines = f.readlines()
                         for line in lines[-20:]:
-                            print(f"    {line.rstrip()}")
+                            logger.error(f"    {line.rstrip()}")
     
     def get_server_for_adapter(self, adapter_name: Optional[str]) -> Tuple[int, str]:
         """Get the GPU ID and server URL that has the given adapter loaded."""
         if adapter_name is None:
             # For baseline (no adapter), use any server
             gpu_id = self.config["gpus"][0]
+            logger.debug(f"Using GPU {gpu_id} for baseline (no adapter)")
             return gpu_id, self.servers[gpu_id]
         
         # Simple hash-based distribution
@@ -196,32 +236,42 @@ class VLLMServerManager:
         gpu_idx = hash_val % len(self.config["gpus"])
         gpu_id = self.config["gpus"][gpu_idx]
         
+        logger.debug(f"Using GPU {gpu_id} for adapter {adapter_name}")
         return gpu_id, self.servers[gpu_id]
     
     def _check_server_ready(self, server_url, timeout=60):
         """Check if a server is ready to accept requests."""
+        logger.debug(f"Checking if server {server_url} is ready...")
         start_time = time.time()
         while time.time() - start_time < timeout:
             try:
-                response = requests.get(f"{server_url}/health")
+                response = requests.get(f"{server_url}/health", timeout=2)
                 if response.status_code == 200:
+                    logger.debug(f"Server {server_url} is ready")
                     return True
-            except:
-                pass
+            except Exception as e:
+                logger.debug(f"Server {server_url} not ready yet: {type(e).__name__}")
             time.sleep(1)
+        logger.debug(f"Server {server_url} failed to become ready after {timeout}s")
         return False
     
     def shutdown_servers(self):
         """Shutdown all vLLM servers."""
-        print("\nShutting down vLLM servers...")
+        logger.info("\nShutting down vLLM servers...")
         for gpu_id, process in self.server_processes.items():
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-            process.wait()
-        print("All servers shut down.")
+            logger.debug(f"Shutting down server on GPU {gpu_id} (PID {process.pid})")
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+                process.wait(timeout=10)
+                logger.debug(f"Server on GPU {gpu_id} shut down cleanly")
+            except Exception as e:
+                logger.error(f"Error shutting down server on GPU {gpu_id}: {e}")
+        logger.info("All servers shut down.")
 
 def evaluate_with_server(adapter_name: Optional[str], server_url: str, gpu_id: int,
                         eval_name: str, eval_data: List[dict], config: dict, tokenizer):
     """Evaluate using a vLLM server."""
+    logger.info(f"Starting evaluation on GPU {gpu_id} - {eval_name} - {adapter_name or 'base'}")
     
     # Prepare prompts
     prompts = []
@@ -231,6 +281,8 @@ def evaluate_with_server(adapter_name: Optional[str], server_url: str, gpu_id: i
         prompt = format_prompt(item["q"], tokenizer)
         prompts.append(prompt)
         correct_answers.append(item["answer_matching_behavior"])
+    
+    logger.debug(f"Prepared {len(prompts)} prompts for evaluation")
     
     # Process in batches
     all_responses = []
@@ -242,12 +294,16 @@ def evaluate_with_server(adapter_name: Optional[str], server_url: str, gpu_id: i
     
     try:
         for i in tqdm(range(0, len(prompts), batch_size), 
-                     desc=f"GPU {gpu_id} - {eval_name} - {adapter_name or 'base'}"):
+                     desc=f"GPU {gpu_id} - {eval_name} - {adapter_name or 'base'}",
+                     disable=False):  # Keep progress bar visible
             batch_prompts = prompts[i:i+batch_size]
+            logger.debug(f"Processing batch {i//batch_size + 1}/{(len(prompts) + batch_size - 1)//batch_size}")
+            
             responses = loop.run_until_complete(
                 send_batch_request(server_url, batch_prompts, adapter_name, config)
             )
             all_responses.extend(responses)
+            logger.debug(f"Received {len(responses)} responses for batch")
     finally:
         loop.close()
     
@@ -260,6 +316,7 @@ def evaluate_with_server(adapter_name: Optional[str], server_url: str, gpu_id: i
             generated_text = response["choices"][0]["text"].strip()
         else:
             generated_text = ""
+            logger.warning(f"Empty response: {response}")
         
         # Extract answer
         answer_found = extract_answer(generated_text)
@@ -274,6 +331,7 @@ def evaluate_with_server(adapter_name: Optional[str], server_url: str, gpu_id: i
         scores.append(1 if answer_found == correct_answer else 0)
     
     accuracy = np.mean(scores) * 100
+    logger.info(f"Completed evaluation: {eval_name} - {adapter_name or 'base'} - Accuracy: {accuracy:.1f}%")
     
     return {
         "accuracy": accuracy,
@@ -329,15 +387,21 @@ class EvaluationPipeline:
         
     def run_pipeline(self, checkpoints: Dict, evals: Dict):
         """Run pipelined evaluation across all checkpoints and evals."""
+        logger.info("Starting evaluation pipeline")
         
         # Load tokenizer
-        print("Loading tokenizer...")
-        tokenizer = AutoTokenizer.from_pretrained(
-            self.config["base_model_path"], 
-            trust_remote_code=True
-        )
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
+        logger.info("Loading tokenizer...")
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.config["base_model_path"], 
+                trust_remote_code=True
+            )
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            logger.info(f"Tokenizer loaded successfully: {type(tokenizer).__name__}")
+        except Exception as e:
+            logger.error(f"Failed to load tokenizer: {e}", exc_info=True)
+            raise
         
         # Prepare all evaluation jobs
         jobs = []
@@ -366,15 +430,21 @@ class EvaluationPipeline:
                         "eval_data": eval_data,
                     })
         
-        print(f"Total evaluation jobs: {len(jobs)}")
+        logger.info(f"Total evaluation jobs: {len(jobs)}")
+        logger.debug(f"Jobs breakdown: {len(checkpoints)} datasets × {len(evals)} evals × checkpoints")
         
         # Run evaluations with thread pool
-        with ThreadPoolExecutor(max_workers=len(self.config["gpus"]) * 2) as executor:
+        max_workers = len(self.config["gpus"]) * 2
+        logger.info(f"Starting thread pool with {max_workers} workers")
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             
             for job in jobs:
                 # Get server for this adapter
                 gpu_id, server_url = self.server_manager.get_server_for_adapter(job["adapter_name"])
+                
+                logger.debug(f"Submitting job: {job['dataset']}/step{job['step']}/{job['eval_name']} to GPU {gpu_id}")
                 
                 future = executor.submit(
                     evaluate_with_server,
@@ -389,12 +459,16 @@ class EvaluationPipeline:
                 futures.append((future, job))
             
             # Process results
+            completed = 0
             with tqdm(total=len(jobs), desc="Overall progress") as pbar:
                 for future, job in futures:
                     try:
+                        logger.debug(f"Waiting for job: {job['dataset']}/step{job['step']}/{job['eval_name']}")
                         result = future.result()
                         key = (job["dataset"], job["step"], job["eval_name"])
                         self.results[key] = result
+                        completed += 1
+                        logger.debug(f"Job completed ({completed}/{len(jobs)}): {key} - Accuracy: {result['accuracy']:.1f}%")
                         pbar.set_postfix({
                             "dataset": job["dataset"],
                             "step": job["step"],
@@ -402,7 +476,7 @@ class EvaluationPipeline:
                             "accuracy": f"{result['accuracy']:.1f}%"
                         })
                     except Exception as e:
-                        print(f"Error evaluating {job}: {str(e)}")
+                        logger.error(f"Error evaluating {job}: {str(e)}", exc_info=True)
                         key = (job["dataset"], job["step"], job["eval_name"])
                         self.results[key] = {
                             "accuracy": 0.0,
@@ -412,17 +486,25 @@ class EvaluationPipeline:
                         }
                     pbar.update(1)
         
+        logger.info(f"Pipeline completed. Processed {len(self.results)} evaluations")
         return self.results
 
 def get_all_checkpoints(checkpoint_dir):
     """Get all checkpoints organized by dataset."""
+    logger.info(f"Scanning for checkpoints in: {checkpoint_dir}")
     checkpoints = defaultdict(list)
+    
+    if not os.path.exists(checkpoint_dir):
+        logger.error(f"Checkpoint directory does not exist: {checkpoint_dir}")
+        return checkpoints
     
     for dataset_dir in os.listdir(checkpoint_dir):
         dataset_path = os.path.join(checkpoint_dir, dataset_dir)
         if os.path.isdir(dataset_path):
             checkpoint_dirs = glob.glob(os.path.join(dataset_path, "checkpoint-*"))
             checkpoint_dirs.sort(key=lambda x: int(x.split("-")[-1]))
+            
+            logger.debug(f"Found {len(checkpoint_dirs)} checkpoints in {dataset_dir}")
             
             for ckpt_dir in checkpoint_dirs:
                 step = int(ckpt_dir.split("-")[-1])
@@ -431,19 +513,33 @@ def get_all_checkpoints(checkpoint_dir):
                     "step": step,
                     "dataset": dataset_dir
                 })
+                logger.debug(f"  Added checkpoint: {dataset_dir}/step{step}")
     
+    logger.info(f"Total checkpoints found: {sum(len(ckpts) for ckpts in checkpoints.values())} across {len(checkpoints)} datasets")
     return checkpoints
 
 def get_all_evals(evals_dir):
     """Get all evaluation files."""
+    logger.info(f"Loading evaluations from: {evals_dir}")
+    
+    if not os.path.exists(evals_dir):
+        logger.error(f"Evaluation directory does not exist: {evals_dir}")
+        return {}
+    
     eval_files = glob.glob(os.path.join(evals_dir, "*.json"))
     evals = {}
     
     for eval_file in eval_files:
         eval_name = os.path.basename(eval_file).replace(".json", "")
-        with open(eval_file, "r") as f:
-            evals[eval_name] = json.load(f)
+        try:
+            with open(eval_file, "r") as f:
+                eval_data = json.load(f)
+                evals[eval_name] = eval_data
+                logger.debug(f"Loaded {eval_name}: {len(eval_data)} questions")
+        except Exception as e:
+            logger.error(f"Failed to load {eval_file}: {e}")
     
+    logger.info(f"Loaded {len(evals)} evaluation sets")
     return evals
 
 def save_results(results, results_dir, timestamp):
@@ -551,64 +647,86 @@ def save_results(results, results_dir, timestamp):
 def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    print("=" * 80)
-    print(f"Starting server-based evaluation at {timestamp}")
-    print(f"Configuration:")
+    logger.info("=" * 80)
+    logger.info(f"Starting server-based evaluation at {timestamp}")
+    logger.info(f"Configuration:")
     for key, value in CONFIG.items():
-        print(f"  {key}: {value}")
-    print("=" * 80)
+        logger.info(f"  {key}: {value}")
+    logger.info("=" * 80)
     
     # Initialize server manager
     server_manager = VLLMServerManager(CONFIG)
     
     try:
         # Get checkpoints first
-        print("\nDiscovering checkpoints...")
+        logger.info("\nDiscovering checkpoints...")
         checkpoints = get_all_checkpoints(CONFIG["checkpoint_dir"])
         total_checkpoints = sum(len(ckpts) for ckpts in checkpoints.values())
-        print(f"Found {total_checkpoints} checkpoints across {len(checkpoints)} datasets")
+        logger.info(f"Found {total_checkpoints} checkpoints across {len(checkpoints)} datasets")
+        
+        if not checkpoints:
+            logger.error("No checkpoints found! Exiting.")
+            return
         
         # Start vLLM servers with discovered checkpoints
+        logger.info("\nStarting vLLM servers...")
         server_manager.start_servers(checkpoints)
         
-        print("\nLoading evaluations...")
+        logger.info("\nLoading evaluations...")
         evals = get_all_evals(CONFIG["alek_evals_dir"])
-        print(f"Found {len(evals)} evaluation sets")
+        logger.info(f"Found {len(evals)} evaluation sets")
+        
+        if not evals:
+            logger.error("No evaluations found! Exiting.")
+            return
         
         # Ensure MMLU is available
         if not os.path.exists("alek-evals/mmlu.json"):
-            print("MMLU not found. Downloading...")
-            subprocess.run(["python", "download_and_prepare_mmlu.py"], check=True)
-            evals = get_all_evals(CONFIG["alek_evals_dir"])
+            logger.info("MMLU not found. Downloading...")
+            try:
+                subprocess.run(["python", "download_and_prepare_mmlu.py"], check=True)
+                evals = get_all_evals(CONFIG["alek_evals_dir"])
+            except subprocess.CalledProcessError as e:
+                logger.error(f"Failed to download MMLU: {e}")
         
         # Run evaluation pipeline
+        logger.info("\nStarting evaluation pipeline...")
         pipeline = EvaluationPipeline(server_manager, CONFIG)
         results = pipeline.run_pipeline(checkpoints, evals)
         
         # Save results
-        print("\nSaving results...")
+        logger.info("\nSaving results...")
         save_results(results, CONFIG["results_dir"], timestamp)
         
         # Print summary
-        print("\nSummary by dataset:")
+        logger.info("\nSummary by dataset:")
         by_dataset = defaultdict(list)
         for (dataset, step, eval_name), result in results.items():
             by_dataset[dataset].append(result["accuracy"])
         
         for dataset, accuracies in by_dataset.items():
-            print(f"  {dataset}: {np.mean(accuracies):.1f}% ± {np.std(accuracies):.1f}%")
+            logger.info(f"  {dataset}: {np.mean(accuracies):.1f}% ± {np.std(accuracies):.1f}%")
         
+    except Exception as e:
+        logger.error(f"Fatal error in main: {e}", exc_info=True)
+        raise
     finally:
         # Shutdown servers
+        logger.info("\nShutting down servers...")
         server_manager.shutdown_servers()
     
-    print("\nEvaluation complete!")
+    logger.info("\nEvaluation complete!")
 
 if __name__ == "__main__":
     # Handle Ctrl+C gracefully
     def signal_handler(sig, frame):
-        print("\nInterrupted! Shutting down servers...")
+        logger.warning("\nInterrupted! Shutting down servers...")
         sys.exit(0)
     
     signal.signal(signal.SIGINT, signal_handler)
-    main() 
+    
+    try:
+        main()
+    except Exception as e:
+        logger.error(f"Unhandled exception: {e}", exc_info=True)
+        sys.exit(1) 
