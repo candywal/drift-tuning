@@ -13,15 +13,17 @@ CONFIG = {
     "tensor_parallel_size": 1,  # Use 1 GPU per model for faster loading
     "num_parallel_jobs": 4,  # Run 4 models in parallel (1 GPU each)
     "max_eval_samples": 200,  # Limit each eval to 200 questions
-    "gpu_memory_utilization": 0.95,  # Increased from 0.8 for H100s
+    "gpu_memory_utilization": 0.9,  # Increased from 0.8 for H100s
     "enable_prefix_caching": True,  # Enable prefix caching for faster inference
     "swap_space": 4,  # GB of CPU swap space for large batches
-    "use_hotswapping": True,  # Use LoRA hotswapping for 10-20x speedup
+    "use_hotswapping": False,  # Disabled due to result collection issues
+    "disable_custom_all_reduce": True,  # Fix for multi-GPU issues
+    "enforce_eager": False,  # Can use compilation with legacy engine
 }
 
-# NOTE: The main bottleneck is model loading/unloading for each evaluation.
-# With hotswapping enabled, the model is loaded once per GPU and only LoRA adapters
-# are swapped between evaluations. This can provide 10-20x speedup!
+# NOTE: To use vLLM's legacy engine (V0) for LoRA hotswapping compatibility,
+# run with: VLLM_USE_V1=0 python eval.py
+# The V1 engine has known issues with torch.compile and LoRA adapters.
 
 import os
 import json
@@ -551,7 +553,6 @@ def evaluate_multiple_checkpoints(job_list, gpu_ids, config):
             enable_prefix_caching=config.get("enable_prefix_caching", True),
             swap_space=config.get("swap_space", 4),
             disable_log_stats=True,
-            enforce_eager=True,  # Disable torch.compile to avoid the compilation error
         )
         print(f"Model loaded on GPU {gpu_ids[0]}")
         
